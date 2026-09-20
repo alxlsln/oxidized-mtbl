@@ -1,5 +1,6 @@
 #[cfg(test)]
-#[macro_use] extern crate quickcheck;
+#[macro_use]
+extern crate quickcheck;
 
 const DEFAULT_BLOCK_RESTART_INTERVAL: usize = 16;
 const DEFAULT_BLOCK_SIZE: u64 = 8192;
@@ -21,14 +22,15 @@ const MAGIC_V1: u32 = 0x77846676;
 
 use std::sync::Arc;
 
-pub use error::Error;
-pub use compression::CompressionType;
+pub use self::merger::{Merger, MergerBuilder, MergerIter};
 pub use self::metadata::Metadata;
 pub use self::reader::{Reader, ReaderBuilder, ReaderIntoGet, ReaderIntoIter};
-pub use self::writer::{Writer, WriterBuilder};
-pub use self::merger::{Merger, MergerBuilder, MergerIter};
 pub use self::sorter::{Sorter, SorterBuilder};
+pub use self::writer::{Writer, WriterBuilder};
+pub use compression::CompressionType;
+pub use error::Error;
 
+mod async_reader;
 mod block;
 mod block_builder;
 mod compression;
@@ -72,7 +74,11 @@ impl<A> BytesView<A> {
     fn from_bytes(bytes: Vec<u8>) -> Self {
         let length = bytes.len();
         let inner = InnerBytesView::Bytes(Arc::from(bytes));
-        BytesView { inner, offset: 0, length }
+        BytesView {
+            inner,
+            offset: 0,
+            length,
+        }
     }
 
     fn slice(&self, offset: usize, length: usize) -> Self {
@@ -102,7 +108,11 @@ impl<A: AsRef<[u8]>> From<A> for BytesView<A> {
     fn from(data: A) -> BytesView<A> {
         let length = data.as_ref().len();
         let inner = InnerBytesView::Data(Arc::new(data));
-        BytesView { inner, offset: 0, length }
+        BytesView {
+            inner,
+            offset: 0,
+            length,
+        }
     }
 }
 
