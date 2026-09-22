@@ -138,7 +138,7 @@ where
         Ok(index)
     }
 
-    async fn block_at_index(&self, offset: usize) -> Result<Block<Vec<u8>>, Error> {
+    async fn block_at_offset(&self, offset: usize) -> Result<Block<Vec<u8>>, Error> {
         // assert!(offset < self.data.len());
         // keep data len from read_index_block
 
@@ -174,21 +174,25 @@ where
         Ok(block)
     }
 
+    async fn block_at_index(
+        &self,
+        index_iter: &BlockIter<Vec<u8>>,
+    ) -> Result<Option<Block<Vec<u8>>>, Error> {
+        match index_iter.get() {
+            Some((_key, value)) => {
+                let mut offset = 0;
+                varint_decode64(value, &mut offset);
+
+                self.block_at_offset(offset as usize).await.map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn find_block(&self, key: &[u8]) -> Result<Option<Block<Vec<u8>>>, Error> {
         let mut index_iter = BlockIter::init(self.index.clone());
         index_iter.seek(key);
-
-        let (_index_key, value) = match index_iter.get() {
-            Some(entry) => entry,
-            None => return Ok(None),
-        };
-
-        let mut offset = 0;
-        varint_decode64(value, &mut offset);
-
-        let block = self.block_at_index(offset as usize).await?;
-
-        Ok(Some(block))
+        self.block_at_index(&index_iter).await
     }
 
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
@@ -256,7 +260,7 @@ mod tests {
         println!("offset_len = {offset_len}");
         println!("offset = {offset}");
 
-        let block = reader.block_at_index(offset as usize).await?;
+        let block = reader.block_at_offset(offset as usize).await?;
         let mut block_iter = BlockIter::init(Arc::new(block));
         block_iter.seek_to_first();
 
