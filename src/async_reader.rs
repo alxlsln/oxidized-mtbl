@@ -1,6 +1,7 @@
 use crate::block::{Block, BlockIter};
 use crate::compression::decompress;
 use crate::error::MtblError;
+use crate::reader::ReaderIterType;
 use crate::varint::varint_decode64;
 use crate::{error::Error, Metadata};
 use crate::{metadata, BytesView, FileVersion, METADATA_SIZE};
@@ -215,6 +216,165 @@ where
             Ok(None)
         }
     }
+
+    pub async fn into_iter(self) -> Result<AsyncReaderIter<R>, Error> {
+        AsyncReaderIter::new(self).await
+    }
+}
+
+pub struct AsyncReaderIter<R>
+where
+    R: AsyncReadAt + AsyncFileSize,
+{
+    reader: AsyncReader<R>,
+    block_iter: Option<BlockIter<Vec<u8>>>,
+    index_iter: BlockIter<Vec<u8>>,
+    k: Vec<u8>,
+    first: bool,
+    valid: bool,
+    it_type: ReaderIterType,
+}
+
+impl<R> AsyncReaderIter<R>
+where
+    R: AsyncReadAt + AsyncFileSize,
+{
+    async fn new(reader: AsyncReader<R>) -> Result<Self, Error> {
+        let mut index_iter = BlockIter::init(reader.index.clone());
+        index_iter.seek_to_first();
+
+        let block_iter = match reader.block_at_index(&index_iter).await? {
+            Some(b) => {
+                let mut block_iter = BlockIter::init(Arc::new(b));
+                block_iter.seek_to_first();
+                Some(block_iter)
+            }
+            None => None,
+        };
+
+        let valid = block_iter.is_some();
+
+        Ok(AsyncReaderIter {
+            reader: reader,
+            index_iter,
+            block_iter,
+            k: Vec::new(),
+            first: true,
+            valid: valid,
+            it_type: ReaderIterType::Iter,
+        })
+    }
+
+    async fn new_from(reader: AsyncReader<R>, k: &[u8]) -> Result<Self, Error> {
+        let mut index_iter = BlockIter::init(reader.index.clone());
+        index_iter.seek(k);
+
+        let block_iter = match reader.block_at_index(&index_iter).await? {
+            Some(b) => {
+                let mut block_iter = BlockIter::init(Arc::new(b));
+                block_iter.seek(k);
+                Some(block_iter)
+            }
+            None => None,
+        };
+
+        let valid = block_iter.is_some();
+
+        Ok(AsyncReaderIter {
+            reader: reader,
+            index_iter,
+            block_iter,
+            k: Vec::new(),
+            first: true,
+            valid: valid,
+            it_type: ReaderIterType::Iter,
+        })
+    }
+
+    async fn load_current_block(&mut self) -> Result<bool, Error> {
+        let block = self.reader.block_at_index(&self.index_iter).await?;
+
+        match block {
+            Some(block) => {
+                let mut block_iter = BlockIter::init(Arc::new(block));
+                block_iter.seek_to_first();
+
+                self.block_iter = Some(block_iter);
+
+                Ok(true)
+            }
+            None => {
+                self.block_iter = None;
+                Ok(false)
+            }
+        }
+    }
+
+    pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
+        if !self.valid {
+            return Ok(None);
+        }
+        let block_iter = match self.block_iter.as_mut() {
+            Some(block_iter) => block_iter,
+            None => return Err(Error::from(MtblError::InvalidBlock)),
+        };
+
+        if !self.first {
+            block_iter.next();
+        }
+        self.first = false;
+
+        let (key, val) = match block_iter.get() {
+            Some((key, value)) => (key.to_vec(), value.to_vec()),
+            None => {
+                self.valid = false;
+
+                // Init next data into block_iter and get first value
+                if !self.index_iter.next() {
+                    return Ok(None);
+                }
+
+                if !self.load_current_block().await? {
+                    return Ok(None);
+                };
+
+                let block_iter = match self.block_iter.as_mut() {
+                    Some(block_iter) => block_iter,
+                    None => {
+                        return Err(Error::from(MtblError::InvalidBlock));
+                    }
+                };
+
+                match block_iter.get() {
+                    Some((key, value)) => {
+                        return {
+                            self.valid = true;
+                            Ok(Some((key.to_vec(), value.to_vec())))
+                        }
+                    }
+                    None => {
+                        return Err(Error::from(MtblError::InvalidBlock));
+                    }
+                }
+            }
+        };
+
+        match self.it_type {
+            ReaderIterType::Iter => (),
+            ReaderIterType::Get => {
+                if key != self.k.as_slice() {
+                    self.valid = false;
+                }
+            }
+            _ => todo!(),
+        }
+
+        if self.valid {
+            Ok(Some((key, val)))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +466,24 @@ mod tests {
         assert_eq!(value, None);
         let value = reader.get(b"aaaa5").await?;
         assert_eq!(value, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter() -> Result<(), Error> {
+        let test_path = "./test-verify-good1.data";
+        let local_reader = LocalReader::open(test_path.to_string()).await?;
+        let reader = AsyncReader::new(local_reader).await?;
+        let mut iter = reader.into_iter().await?;
+
+        while let Some((key, value)) = iter.next().await? {
+            println!(
+                "{} = {}",
+                String::from_utf8_lossy(&key),
+                String::from_utf8_lossy(&value)
+            );
+        }
 
         Ok(())
     }

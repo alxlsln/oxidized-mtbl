@@ -7,8 +7,8 @@ use byteorder::{ByteOrder, LittleEndian};
 use crate::block::{Block, BlockIter};
 use crate::compression::decompress;
 use crate::error::{Error, MtblError};
-use crate::METADATA_SIZE;
 use crate::varint::varint_decode64;
+use crate::METADATA_SIZE;
 use crate::{BytesView, FileVersion, Metadata};
 
 #[derive(Debug, Clone, Copy)]
@@ -30,7 +30,7 @@ impl ReaderBuilder {
 
     pub fn read<A: AsRef<[u8]>>(&mut self, data: A) -> Result<Reader<A>, Error> {
         if data.as_ref().len() < METADATA_SIZE {
-            return Err(Error::from(MtblError::InvalidMetadataSize))
+            return Err(Error::from(MtblError::InvalidMetadataSize));
         }
 
         let metadata_offset = data.as_ref().len() - METADATA_SIZE;
@@ -53,10 +53,15 @@ impl ReaderBuilder {
 
         if metadata.file_version == FileVersion::FormatV1 {
             index_len_len = mem::size_of::<u32>();
-            index_len = LittleEndian::read_u32(&data.as_ref()[metadata.index_block_offset as usize..]) as usize;
+            index_len =
+                LittleEndian::read_u32(&data.as_ref()[metadata.index_block_offset as usize..])
+                    as usize;
         } else {
             let mut tmp = 0;
-            index_len_len = varint_decode64(&data.as_ref()[metadata.index_block_offset as usize..], &mut tmp);
+            index_len_len = varint_decode64(
+                &data.as_ref()[metadata.index_block_offset as usize..],
+                &mut tmp,
+            );
             index_len = tmp as usize;
             if index_len as u64 != tmp {
                 return Err(Error::from(MtblError::InvalidIndexLength));
@@ -67,17 +72,26 @@ impl ReaderBuilder {
         let data = BytesView::from(data);
         let index_data = data.slice(start, index_len);
 
-        #[cfg(feature = "checksum")] {
-        if self.verify_checksums {
-            let index_crc = LittleEndian::read_u32(&data.as_ref()[metadata.index_block_offset as usize + index_len_len..]);
-            assert_eq!(index_crc, crc32c::crc32c(index_data.as_ref()));
-        } }
+        #[cfg(feature = "checksum")]
+        {
+            if self.verify_checksums {
+                let index_crc = LittleEndian::read_u32(
+                    &data.as_ref()[metadata.index_block_offset as usize + index_len_len..],
+                );
+                assert_eq!(index_crc, crc32c::crc32c(index_data.as_ref()));
+            }
+        }
 
         let index = Block::init(index_data).ok_or(MtblError::InvalidBlock)?;
         let index = Arc::new(index);
         let verify_checksums = self.verify_checksums;
 
-        Ok(Reader { metadata, data, verify_checksums, index })
+        Ok(Reader {
+            metadata,
+            data,
+            verify_checksums,
+            index,
+        })
     }
 }
 
@@ -111,11 +125,9 @@ impl<A: AsRef<[u8]>> Reader<A> {
     pub fn get(self, key: &[u8]) -> Result<Option<ReaderIntoGet<A>>, Error> {
         let mut iter = ReaderIntoIter::new_get(self, key)?;
         match iter.next() {
-            Some(_) => {
-                match iter.bi {
-                    Some(bi) => Ok(ReaderIntoGet::new(bi)),
-                    None => Ok(None),
-                }
+            Some(_) => match iter.bi {
+                Some(bi) => Ok(ReaderIntoGet::new(bi)),
+                None => Ok(None),
             },
             None => Ok(None),
         }
@@ -156,12 +168,15 @@ impl<A: AsRef<[u8]>> Reader<A> {
         let raw_start = offset + raw_contents_size_len + mem::size_of::<u32>();
         let raw_contents = &self.data.as_ref()[raw_start..raw_start + raw_contents_size];
 
-        #[cfg(feature = "checksum")] {
-        if self.verify_checksums {
-            let block_crc = LittleEndian::read_u32(&self.data.as_ref()[offset + raw_contents_size_len..]);
-            let calc_crc = crc32c::crc32c(raw_contents);
-            assert_eq!(block_crc, calc_crc);
-        } }
+        #[cfg(feature = "checksum")]
+        {
+            if self.verify_checksums {
+                let block_crc =
+                    LittleEndian::read_u32(&self.data.as_ref()[offset + raw_contents_size_len..]);
+                let calc_crc = crc32c::crc32c(raw_contents);
+                assert_eq!(block_crc, calc_crc);
+            }
+        }
 
         let data = decompress(self.metadata.compression_algorithm, raw_contents)?;
         let data = match data {
@@ -180,7 +195,7 @@ impl<A: AsRef<[u8]>> Reader<A> {
                 let mut offset = 0;
                 varint_decode64(val, &mut offset);
                 self.block(offset as usize).map(Some)
-            },
+            }
             None => Ok(None),
         }
     }
@@ -209,7 +224,7 @@ impl<A: AsRef<[u8]>> AsRef<[u8]> for ReaderIntoGet<A> {
     }
 }
 
-enum ReaderIterType {
+pub enum ReaderIterType {
     Iter,
     Get,
     GetPrefix,
@@ -237,7 +252,7 @@ impl<A: AsRef<[u8]>> ReaderIntoIter<A> {
                 let mut bi = BlockIter::init(Arc::new(b));
                 bi.seek_to_first();
                 Some(bi)
-            },
+            }
             None => None,
         };
 
@@ -262,7 +277,7 @@ impl<A: AsRef<[u8]>> ReaderIntoIter<A> {
                 let mut bi = BlockIter::init(Arc::new(b));
                 bi.seek(key);
                 Some(bi)
-            },
+            }
             None => None,
         };
 
@@ -353,7 +368,7 @@ impl<A: AsRef<[u8]>> ReaderIntoIter<A> {
                 let key: &'static _ = unsafe { mem::transmute(key) };
                 let val: &'static _ = unsafe { mem::transmute(val) };
                 (key, val)
-            },
+            }
             None => {
                 self.valid = false;
                 if !self.index_iter.next() {
@@ -369,15 +384,15 @@ impl<A: AsRef<[u8]>> ReaderIntoIter<A> {
                         self.valid = entry.is_some();
 
                         entry?
-                    },
+                    }
                     Ok(None) => {
                         self.valid = false;
                         return None;
-                    },
+                    }
                     Err(e) => {
                         self.valid = false;
-                        return Some(Err(e))
-                    },
+                        return Some(Err(e));
+                    }
                 }
             }
         };
@@ -401,6 +416,10 @@ impl<A: AsRef<[u8]>> ReaderIntoIter<A> {
             }
         }
 
-        if self.valid { Some(Ok((key, val))) } else { None }
+        if self.valid {
+            Some(Ok((key, val)))
+        } else {
+            None
+        }
     }
 }
