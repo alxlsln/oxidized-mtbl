@@ -196,29 +196,55 @@ where
         self.block_at_index(&index_iter).await
     }
 
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        let block = match self.find_block(key).await? {
-            Some(block) => block,
-            None => return Ok(None),
-        };
-
-        let mut block_iter = BlockIter::init(Arc::new(block));
-        block_iter.seek(key);
-
-        let (find_key, value) = match block_iter.get() {
-            Some(entry) => entry,
-            None => return Ok(None),
-        };
-
-        if key == find_key {
-            Ok(Some(value.to_vec()))
-        } else {
-            Ok(None)
+    pub async fn get(self, key: &[u8]) -> Result<Option<AsyncReaderGet>, Error> {
+        let mut iter = AsyncReaderIter::new_get(self, key).await?;
+        match iter.next().await? {
+            // Some((_, value)) => Ok(Some(value.to_vec())),
+            Some(_) => match iter.block_iter {
+                Some(block_iter) => Ok(AsyncReaderGet::new(block_iter)),
+                None => Ok(None),
+            },
+            None => Ok(None),
         }
     }
 
     pub async fn into_iter(self) -> Result<AsyncReaderIter<R>, Error> {
         AsyncReaderIter::new(self).await
+    }
+
+    pub async fn iter_from(self, start: &[u8]) -> Result<AsyncReaderIter<R>, Error> {
+        AsyncReaderIter::new_from(self, start).await
+    }
+
+    pub async fn iter_prefix(self, prefix: &[u8]) -> Result<AsyncReaderIter<R>, Error> {
+        AsyncReaderIter::new_get_prefix(self, prefix).await
+    }
+
+    pub async fn iter_range(self, start: &[u8], end: &[u8]) -> Result<AsyncReaderIter<R>, Error> {
+        AsyncReaderIter::new_get_range(self, start, end).await
+    }
+}
+
+pub struct AsyncReaderGet {
+    block: Arc<Block<Vec<u8>>>,
+    val_offset: usize,
+    val_len: usize,
+}
+
+impl AsyncReaderGet {
+    fn new(block_iter: BlockIter<Vec<u8>>) -> Option<Self> {
+        let (offset, length) = block_iter.val?;
+
+        Some(Self {
+            block: block_iter.block,
+            val_offset: offset,
+            val_len: length,
+        })
+    }
+}
+impl AsRef<[u8]> for AsyncReaderGet {
+    fn as_ref(&self) -> &[u8] {
+        &self.block.as_ref().as_ref()[self.val_offset..self.val_offset + self.val_len]
     }
 }
 
@@ -291,6 +317,27 @@ where
         })
     }
 
+    async fn new_get(r: AsyncReader<R>, key: &[u8]) -> Result<Self, Error> {
+        let mut iter = AsyncReaderIter::new_from(r, key).await?;
+        iter.k.extend_from_slice(key);
+        iter.it_type = ReaderIterType::Get;
+        Ok(iter)
+    }
+
+    async fn new_get_prefix(r: AsyncReader<R>, prefix: &[u8]) -> Result<Self, Error> {
+        let mut iter = Self::new_from(r, prefix).await?;
+        iter.k.extend_from_slice(prefix);
+        iter.it_type = ReaderIterType::GetPrefix;
+        Ok(iter)
+    }
+
+    async fn new_get_range(r: AsyncReader<R>, start: &[u8], end: &[u8]) -> Result<Self, Error> {
+        let mut iter = Self::new_from(r, start).await?;
+        iter.k.extend_from_slice(end);
+        iter.it_type = ReaderIterType::GetRange;
+        Ok(iter)
+    }
+
     async fn load_current_block(&mut self) -> Result<bool, Error> {
         let block = self.reader.block_at_index(&self.index_iter).await?;
 
@@ -347,10 +394,8 @@ where
 
                 match block_iter.get() {
                     Some((key, value)) => {
-                        return {
-                            self.valid = true;
-                            Ok(Some((key.to_vec(), value.to_vec())))
-                        }
+                        self.valid = true;
+                        (key.to_vec(), value.to_vec())
                     }
                     None => {
                         return Err(Error::from(MtblError::InvalidBlock));
@@ -366,7 +411,16 @@ where
                     self.valid = false;
                 }
             }
-            _ => todo!(),
+            ReaderIterType::GetPrefix => {
+                if !(self.k.len() <= key.len() && key.starts_with(&self.k)) {
+                    self.valid = false;
+                }
+            }
+            ReaderIterType::GetRange => {
+                if key > self.k {
+                    self.valid = false;
+                }
+            }
         }
 
         if self.valid {
@@ -379,30 +433,81 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs::File;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    use crate::compression::CompressionType;
+    use crate::writer::WriterBuilder;
+
     use crate::block::BlockIter;
+    use crate::error::{Error, MtblError};
+    use crate::varint::varint_decode64;
 
     use super::*;
 
+    const TEST_ENTRIES: usize = 300_000;
+
+    fn test_file() -> PathBuf {
+        static TEST_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+        TEST_FILE
+            .get_or_init(|| {
+                let path = env::temp_dir().join(format!(
+                    "oxidized-mtbl-async-reader-test-{}.data",
+                    std::process::id()
+                ));
+
+                // Generate the test database only once.
+                if !path.exists() {
+                    let file = File::create(&path).expect("failed to create test file");
+
+                    let mut writer = WriterBuilder::new()
+                        .compression_type(CompressionType::Snappy)
+                        .build(file);
+
+                    for i in 0..TEST_ENTRIES {
+                        let key = format!("{:010}", i);
+                        let value = format!("{:010}", i).repeat(i / 10_000);
+
+                        writer
+                            .insert(key, value)
+                            .expect("failed to insert test entry");
+                    }
+
+                    writer.finish().expect("failed to finish test writer");
+                }
+
+                path
+            })
+            .clone()
+    }
+
+    async fn open_test_reader() -> Result<AsyncReader<LocalReader>, Error> {
+        let path = test_file();
+
+        let local_reader = LocalReader::open(path.to_string_lossy().into_owned()).await?;
+
+        AsyncReader::new(local_reader).await
+    }
+
+    fn expected_value(i: usize) -> Vec<u8> {
+        format!("{:010}", i).repeat(i / 10_000).into_bytes()
+    }
+
     #[tokio::test]
     async fn test_open() -> Result<(), Error> {
-        let test_path = "./test-verify-good1.data";
-        let local_reader = LocalReader::open(test_path.to_string()).await?;
-        let reader = AsyncReader::new(local_reader).await?;
-        assert_eq!(reader.metadata.count_entries, 128);
-        let buf = reader.read_at(10, 10).await?;
-        assert_eq!(
-            buf,
-            vec![6u8, 107u8, 101u8, 121u8, 48u8, 48u8, 48u8, 118u8, 97u8, 108u8]
-        );
+        let reader = open_test_reader().await?;
+
+        assert_eq!(reader.metadata.count_entries as usize, TEST_ENTRIES);
 
         Ok(())
     }
+
     #[tokio::test]
     async fn test_read_index_block() -> Result<(), Error> {
-        let test_path = "./test-verify-good1.data";
-
-        let local_reader = LocalReader::open(test_path.to_string()).await?;
-        let reader = AsyncReader::new(local_reader).await?;
+        let reader = open_test_reader().await?;
 
         let index = reader.index.clone();
 
@@ -411,79 +516,296 @@ mod tests {
 
         let (key, value) = index_iter.get().ok_or(MtblError::InvalidBlock)?;
 
-        println!("key   = {:?}", key);
-        println!("value = {:?}", value);
+        println!("first index key   = {:?}", key);
+        println!("first index value = {:?}", value);
 
         let mut offset = 0;
         let offset_len = varint_decode64(value, &mut offset);
 
         println!("offset_len = {offset_len}");
-        println!("offset = {offset}");
+        println!("offset     = {offset}");
 
         let block = reader.block_at_offset(offset as usize).await?;
+
         let mut block_iter = BlockIter::init(Arc::new(block));
         block_iter.seek_to_first();
 
         let (key, value) = block_iter.get().ok_or(MtblError::InvalidBlock)?;
 
-        println!("key   = {:?}", key);
-        println!("value = {:?}", value);
+        println!("first block key   = {}", String::from_utf8_lossy(key));
+        println!("first block value = {}", String::from_utf8_lossy(value));
+
+        assert_eq!(key, b"0000000000");
+        assert_eq!(value, b"");
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_find_block() -> Result<(), Error> {
-        let test_path = "./test-verify-good1.data";
+        let reader = open_test_reader().await?;
 
-        let local_reader = LocalReader::open(test_path.to_string()).await?;
-        let reader = AsyncReader::new(local_reader).await?;
+        let block = reader
+            .find_block(b"0000012345")
+            .await?
+            .ok_or(MtblError::InvalidBlock)?;
 
-        let block = reader.find_block(b"key095").await?.unwrap();
         let mut block_iter = BlockIter::init(Arc::new(block));
-        block_iter.seek(b"key095");
+        block_iter.seek(b"0000012345");
 
         let (key, value) = block_iter.get().ok_or(MtblError::InvalidBlock)?;
 
-        println!("key   = {:}", String::from_utf8_lossy(&key));
-        println!("value = {:?}", String::from_utf8_lossy(&value));
-
-        assert_eq!(value, b"val095");
+        assert_eq!(key, b"0000012345");
+        assert_eq!(value, expected_value(12_345));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_get_key() -> Result<(), Error> {
-        let test_path = "./test-verify-good1.data";
+        let reader = open_test_reader().await?;
 
-        let local_reader = LocalReader::open(test_path.to_string()).await?;
-        let reader = AsyncReader::new(local_reader).await?;
+        let value = reader.get(b"0000012345").await?.expect("key should exist");
 
-        let value = reader.get(b"key094").await?;
-        assert_eq!(value, Some(b"val094".to_vec()));
-        let value = reader.get(b"key0955").await?;
-        assert_eq!(value, None);
-        let value = reader.get(b"aaaa5").await?;
-        assert_eq!(value, None);
+        assert_eq!(value.as_ref(), expected_value(12_345).as_slice());
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_iter() -> Result<(), Error> {
-        let test_path = "./test-verify-good1.data";
-        let local_reader = LocalReader::open(test_path.to_string()).await?;
-        let reader = AsyncReader::new(local_reader).await?;
+        let reader = open_test_reader().await?;
         let mut iter = reader.into_iter().await?;
 
+        let mut count = 0;
+
         while let Some((key, value)) = iter.next().await? {
-            println!(
-                "{} = {}",
-                String::from_utf8_lossy(&key),
-                String::from_utf8_lossy(&value)
+            let expected_key = format!("{:010}", count);
+
+            assert_eq!(key, expected_key.as_bytes(), "invalid key at index {count}");
+
+            assert_eq!(
+                value,
+                expected_value(count),
+                "invalid value for key {expected_key}"
             );
+
+            count += 1;
         }
+
+        assert_eq!(count, TEST_ENTRIES);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter_from() -> Result<(), Error> {
+        let reader = open_test_reader().await?;
+
+        let start = 123_456usize;
+
+        let mut iter = reader
+            .iter_from(format!("{:010}", start).as_bytes())
+            .await?;
+
+        let mut count = 0;
+
+        while let Some((key, value)) = iter.next().await? {
+            let i = start + count;
+
+            assert_eq!(key, format!("{:010}", i).as_bytes());
+            assert_eq!(value, expected_value(i));
+
+            count += 1;
+        }
+
+        assert_eq!(count, TEST_ENTRIES - start);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter_from_middle_of_key_space() -> Result<(), Error> {
+        let reader = open_test_reader().await?;
+
+        let start = 250_000usize;
+
+        let mut iter = reader
+            .iter_from(format!("{:010}", start).as_bytes())
+            .await?;
+
+        let first = iter
+            .next()
+            .await?
+            .expect("iterator should contain the start key");
+
+        assert_eq!(first.0, b"0000250000");
+        assert_eq!(first.1, expected_value(start));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter_prefix() -> Result<(), Error> {
+        let reader = open_test_reader().await?;
+
+        // Keys are 10 decimal digits.
+        //
+        // "00000" matches:
+        //
+        // 0000000000 ... 0000099999
+        //
+        // => 100_000 entries.
+        let prefix = b"00000";
+
+        let mut iter = reader.iter_prefix(prefix).await?;
+
+        let mut count = 0;
+
+        while let Some((key, value)) = iter.next().await? {
+            assert!(
+                key.starts_with(prefix),
+                "key {:?} does not match prefix {:?}",
+                key,
+                prefix
+            );
+
+            let i = count;
+
+            assert_eq!(key, format!("{:010}", i).as_bytes());
+            assert_eq!(value, expected_value(i));
+
+            count += 1;
+        }
+
+        assert_eq!(count, 100_000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter_prefix_small_range() -> Result<(), Error> {
+        let reader = open_test_reader().await?;
+
+        // Matches exactly:
+        //
+        // 0000123000 ... 0000123999
+        //
+        // => 10_000 entries.
+        let prefix = b"0000123";
+
+        let mut iter = reader.iter_prefix(prefix).await?;
+
+        let mut count = 0;
+
+        while let Some((key, value)) = iter.next().await? {
+            let i = 123_000 + count;
+            assert!(key.starts_with(prefix));
+            assert_eq!(key, format!("{:010}", i).as_bytes());
+            assert_eq!(value, expected_value(i));
+
+            count += 1;
+        }
+
+        assert_eq!(count, 1_000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter_range() -> Result<(), Error> {
+        let reader = open_test_reader().await?;
+
+        let start = 123_450usize;
+        let end = 123_460usize;
+
+        let mut iter = reader
+            .iter_range(
+                format!("{:010}", start).as_bytes(),
+                format!("{:010}", end).as_bytes(),
+            )
+            .await?;
+
+        let mut keys = Vec::new();
+
+        while let Some((key, value)) = iter.next().await? {
+            let key_string = String::from_utf8(key.clone()).unwrap();
+
+            keys.push(key.clone());
+
+            let i: usize = key_string.parse().unwrap();
+
+            assert!((start..=end).contains(&i));
+            assert_eq!(value, expected_value(i));
+        }
+
+        assert_eq!(keys.len(), end - start + 1);
+
+        assert_eq!(keys.first().unwrap(), b"0000123450");
+        assert_eq!(keys.last().unwrap(), b"0000123460");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter_range_across_blocks() -> Result<(), Error> {
+        let reader = open_test_reader().await?;
+
+        // Deliberately use a large range so that the iterator has to
+        // transition between multiple data blocks.
+        let start = 50_000usize;
+        let end = 100_000usize;
+
+        let mut iter = reader
+            .iter_range(
+                format!("{:010}", start).as_bytes(),
+                format!("{:010}", end).as_bytes(),
+            )
+            .await?;
+
+        let mut count = 0;
+
+        while let Some((key, value)) = iter.next().await? {
+            let i = start + count;
+
+            assert_eq!(key, format!("{:010}", i).as_bytes());
+            assert_eq!(value, expected_value(i));
+
+            count += 1;
+        }
+
+        assert_eq!(count, end - start + 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter_range_empty() -> Result<(), Error> {
+        let reader = open_test_reader().await?;
+
+        let mut iter = reader.iter_range(b"0001000000", b"0000999999").await?;
+
+        assert!(iter.next().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter_from_end() -> Result<(), Error> {
+        let reader = open_test_reader().await?;
+
+        let start = TEST_ENTRIES - 1;
+
+        let mut iter = reader
+            .iter_from(format!("{:010}", start).as_bytes())
+            .await?;
+
+        let first = iter.next().await?.expect("last entry should exist");
+
+        assert_eq!(first.0, format!("{:010}", start).as_bytes());
+        assert_eq!(first.1, expected_value(start));
+
+        assert!(iter.next().await?.is_none());
 
         Ok(())
     }
