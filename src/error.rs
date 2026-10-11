@@ -1,7 +1,7 @@
-use std::{fmt, io, error};
+use std::{error, fmt, io};
 
 #[derive(Debug)]
-pub enum Error<U=()> {
+pub enum Error<U = ()> {
     Mtbl(MtblError),
     Io(io::Error),
     Merge(U),
@@ -27,7 +27,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl error::Error for Error { }
+impl error::Error for Error {}
 
 impl<U> From<io::Error> for Error<U> {
     fn from(err: io::Error) -> Error<U> {
@@ -49,6 +49,7 @@ pub enum MtblError {
     InvalidFormatVersion,
     InvalidCompressionAlgorithm,
     InvalidBlock,
+    StorageUnavailable,
 }
 
 impl fmt::Display for MtblError {
@@ -60,8 +61,9 @@ impl fmt::Display for MtblError {
             MtblError::InvalidFormatVersion => f.write_str("invalid format version"),
             MtblError::InvalidCompressionAlgorithm => f.write_str("invalid compression algorithm"),
             MtblError::InvalidBlock => f.write_str("invalid block"),
+            MtblError::StorageUnavailable => f.write_str("invalid S3 connection"),
         }
     }
 }
 
-impl error::Error for MtblError { }
+impl error::Error for MtblError {}

@@ -6,12 +6,19 @@ use crate::varint::varint_decode64;
 use crate::{error::Error, Metadata};
 use crate::{metadata, BytesView, FileVersion, METADATA_SIZE};
 
+use async_trait::async_trait;
+use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::Client;
 use byteorder::{ByteOrder, LittleEndian};
+use load_dotenv::load_dotenv;
 use std::borrow::Cow;
+use std::env;
 use std::mem;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+
+load_dotenv!();
 
 pub struct LocalReader {
     file: File,
@@ -24,6 +31,65 @@ impl LocalReader {
         Ok(Self { file })
     }
 }
+pub struct S3Reader {
+    client: Client,
+    key: String,
+    bucket: String,
+}
+
+impl S3Reader {
+    pub async fn new(key: String, bucket: String) -> Result<Self, Error> {
+        let endpoint = env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://nas:9000".into());
+        let region = env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
+        let access_key = env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+        let secret_key = env::var("S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+
+        let s3_config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(Credentials::new(
+                access_key, secret_key, None, None, "dotenv",
+            ))
+            .region(Region::new(region))
+            .endpoint_url(endpoint)
+            .force_path_style(true) // indispensable pour MinIO
+            .build();
+
+        let client = Client::from_conf(s3_config);
+
+        // Check 1 : le service répond et les credentials sont valides.
+        client
+            .head_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .map_err(|e| {
+                use aws_smithy_types::error::display::DisplayErrorContext;
+                let ctx = DisplayErrorContext(&e);
+                eprintln!("S3 check failed: {ctx}");
+                Error::from(MtblError::StorageUnavailable)
+            })?;
+
+        // Check 2 (recommandé pour un reader) : l'objet existe et on connaît sa taille.
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                eprintln!("S3 object check failed for '{}/{}': {e}", bucket, key);
+                Error::from(MtblError::StorageUnavailable)
+            })?;
+
+        let content_length = head.content_length().unwrap_or(0);
+
+        Ok(Self {
+            client,
+            key,
+            bucket,
+        })
+    }
+}
 
 pub struct AsyncReader<R>
 where
@@ -34,10 +100,17 @@ where
     index: Arc<Block<Vec<u8>>>,
 }
 
-pub trait AsyncReadAt {
+#[async_trait]
+pub trait AsyncReadAt: Send + Sync {
     async fn read_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, Error>;
 }
 
+#[async_trait]
+pub trait AsyncFileSize: Send + Sync {
+    async fn len(&self) -> Result<u64, Error>;
+}
+
+#[async_trait]
 impl AsyncReadAt for LocalReader {
     async fn read_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, Error> {
         let mut buf = vec![0u8; length];
@@ -49,10 +122,7 @@ impl AsyncReadAt for LocalReader {
     }
 }
 
-pub trait AsyncFileSize {
-    async fn len(&self) -> Result<u64, Error>;
-}
-
+#[async_trait]
 impl AsyncFileSize for LocalReader {
     async fn len(&self) -> Result<u64, Error> {
         let file_size = self.file.metadata().await?.len();
@@ -60,21 +130,60 @@ impl AsyncFileSize for LocalReader {
     }
 }
 
-impl<R> AsyncReadAt for AsyncReader<R>
-where
-    R: AsyncReadAt + AsyncFileSize,
-{
+#[async_trait]
+impl AsyncReadAt for S3Reader {
     async fn read_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, Error> {
-        self.reader.read_at(offset, length).await
+        let range = format!("bytes={}-{}", offset, offset + length as u64 - 1);
+
+        let object = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .range(range)
+            .send()
+            .await
+            .map_err(|e| {
+                use aws_smithy_types::error::display::DisplayErrorContext;
+                let ctx = DisplayErrorContext(&e);
+                eprintln!("S3 check failed: {ctx}");
+                Error::from(MtblError::StorageUnavailable)
+            })?
+            .body
+            .collect()
+            .await
+            .map_err(|e| {
+                use aws_smithy_types::error::display::DisplayErrorContext;
+                let ctx = DisplayErrorContext(&e);
+                eprintln!("S3 collect failed: {ctx}");
+                Error::from(MtblError::StorageUnavailable)
+            })?;
+
+        Ok(object.to_vec())
     }
 }
 
-impl<R> AsyncFileSize for AsyncReader<R>
-where
-    R: AsyncReadAt + AsyncFileSize,
-{
+#[async_trait]
+impl AsyncFileSize for S3Reader {
     async fn len(&self) -> Result<u64, Error> {
-        self.reader.len().await
+        dbg!("call len");
+        let response = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .send()
+            .await
+            .map_err(|e| {
+                use aws_smithy_types::error::display::DisplayErrorContext;
+                let ctx = DisplayErrorContext(&e);
+                eprintln!("S3 collect failed: {ctx}");
+                Error::from(MtblError::StorageUnavailable)
+            })?;
+
+        let file_size = response.content_length().unwrap_or(0);
+
+        Ok(file_size as u64)
     }
 }
 
@@ -141,7 +250,7 @@ where
 
     async fn block_at_offset(&self, offset: usize) -> Result<Block<Vec<u8>>, Error> {
         // assert!(offset < self.data.len());
-        // keep data len from read_index_block
+        // TODO keep data len from read_index_block
 
         let raw_contents_size_len: usize;
         let raw_contents_size: usize;
@@ -188,12 +297,6 @@ where
             }
             None => Ok(None),
         }
-    }
-
-    async fn find_block(&self, key: &[u8]) -> Result<Option<Block<Vec<u8>>>, Error> {
-        let mut index_iter = BlockIter::init(self.index.clone());
-        index_iter.seek(key);
-        self.block_at_index(&index_iter).await
     }
 
     pub async fn get(self, key: &[u8]) -> Result<Option<AsyncReaderGet>, Error> {
@@ -437,6 +540,10 @@ mod tests {
     use std::fs::File;
     use std::path::PathBuf;
     use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use indicatif::MultiProgress;
+    use indicatif::{ProgressBar, ProgressStyle};
 
     use crate::compression::CompressionType;
     use crate::writer::WriterBuilder;
@@ -537,26 +644,6 @@ mod tests {
 
         assert_eq!(key, b"0000000000");
         assert_eq!(value, b"");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_find_block() -> Result<(), Error> {
-        let reader = open_test_reader().await?;
-
-        let block = reader
-            .find_block(b"0000012345")
-            .await?
-            .ok_or(MtblError::InvalidBlock)?;
-
-        let mut block_iter = BlockIter::init(Arc::new(block));
-        block_iter.seek(b"0000012345");
-
-        let (key, value) = block_iter.get().ok_or(MtblError::InvalidBlock)?;
-
-        assert_eq!(key, b"0000012345");
-        assert_eq!(value, expected_value(12_345));
 
         Ok(())
     }
@@ -806,7 +893,72 @@ mod tests {
         assert_eq!(first.1, expected_value(start));
 
         assert!(iter.next().await?.is_none());
+        Ok(())
+    }
 
+    async fn iter_s3(mpb: MultiProgress) -> Result<(), Error> {
+        let s3_reader = S3Reader::new("test-data.mtbl".to_owned(), "mtbl-test".to_owned()).await?;
+        let reader = AsyncReader::new(s3_reader).await?;
+        let mut iter = reader.into_iter().await?;
+
+        let pb = mpb.add(ProgressBar::new_spinner());
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} [S3]    {pos} items ({per_sec}) elapsed: {elapsed}")
+                .unwrap(),
+        );
+        pb.enable_steady_tick(Duration::from_millis(250));
+
+        while let Some((_key, _value)) = iter.next().await? {
+            pb.inc(1);
+        }
+
+        pb.finish_with_message(format!("[S3]    terminé : {} items", pb.position()));
+        Ok(())
+    }
+
+    async fn iter_local(path: &str, mpb: MultiProgress) -> Result<(), Error> {
+        let local_reader = LocalReader::open(path.to_owned()).await?;
+        let reader = AsyncReader::new(local_reader).await?;
+        let mut iter = reader.into_iter().await?;
+
+        let pb = mpb.add(ProgressBar::new_spinner());
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.blue} [LOCAL] {pos} items ({per_sec}) elapsed: {elapsed}")
+                .unwrap(),
+        );
+        pb.enable_steady_tick(Duration::from_millis(250));
+
+        while let Some((_key, _value)) = iter.next().await? {
+            pb.inc(1);
+        }
+
+        pb.finish_with_message(format!("[LOCAL] terminé : {} items", pb.position()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iter_both() -> Result<(), Error> {
+        let path = "test-data.mtbl".to_owned();
+        let mpb = MultiProgress::new();
+
+        // MultiProgress est cloneable (interne Arc) -> partageable entre tasks
+        let mpb_local = mpb.clone();
+
+        let s3_task = tokio::spawn(async move {
+            if let Err(e) = iter_s3(mpb).await {
+                eprintln!("[S3] erreur : {e}");
+            }
+        });
+
+        let local_task = tokio::spawn(async move {
+            if let Err(e) = iter_local(&path.clone(), mpb_local).await {
+                eprintln!("[LOCAL] erreur : {e}");
+            }
+        });
+
+        let _ = tokio::join!(s3_task, local_task);
         Ok(())
     }
 }
