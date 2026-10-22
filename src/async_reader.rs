@@ -10,10 +10,15 @@ use async_trait::async_trait;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::Client;
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::Bytes;
+use futures::stream::{self, StreamExt};
+use futures::Stream;
 use load_dotenv::load_dotenv;
 use std::borrow::Cow;
 use std::env;
+use std::marker::PhantomData;
 use std::mem;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -51,7 +56,7 @@ impl S3Reader {
             ))
             .region(Region::new(region))
             .endpoint_url(endpoint)
-            .force_path_style(true) // indispensable pour MinIO
+            .force_path_style(true) 
             .build();
 
         let client = Client::from_conf(s3_config);
@@ -69,7 +74,6 @@ impl S3Reader {
                 Error::from(MtblError::StorageUnavailable)
             })?;
 
-        // Check 2 (recommandé pour un reader) : l'objet existe et on connaît sa taille.
         let head = client
             .head_object()
             .bucket(&bucket)
@@ -534,6 +538,125 @@ where
     }
 }
 
+#[async_trait]
+pub trait AsyncReadBytes: Send + Sync {
+    async fn read_range(&self, offset: u64, length: usize) -> Result<Bytes, Error>;
+}
+
+#[async_trait]
+impl AsyncReadBytes for S3Reader {
+    async fn read_range(&self, offset: u64, length: usize) -> Result<Bytes, Error> {
+        let range = format!("bytes={}-{}", offset, offset + length as u64 - 1);
+
+        let bytes = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .range(range)
+            .send()
+            .await
+            .map_err(|e| {
+                use aws_smithy_types::error::display::DisplayErrorContext;
+                let ctx = DisplayErrorContext(&e);
+                eprintln!("S3 check failed: {ctx}");
+                Error::from(MtblError::StorageUnavailable)
+            })?
+            .body
+            .collect()
+            .await
+            .map_err(|e| {
+                use aws_smithy_types::error::display::DisplayErrorContext;
+                let ctx = DisplayErrorContext(&e);
+                eprintln!("S3 collect failed: {ctx}");
+                Error::from(MtblError::StorageUnavailable)
+            })?;
+        Ok(bytes.into_bytes())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockMeta {
+    offset: u64,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct GetRange {
+    pub offset: u64,
+    pub len: usize,
+    pub blocks: Vec<BlockMeta>,
+}
+
+pub fn coalesce(blocks: &[BlockMeta], max_range: usize) -> Vec<GetRange> {
+    let mut result: Vec<GetRange> = Vec::new();
+
+    for block in blocks {
+        if let Some(last) = result.last_mut() {
+            let end = last.offset + last.len as u64;
+
+            if block.offset == end && block.len <= max_range.saturating_sub(last.len) {
+                last.len += block.len;
+                last.blocks.push(*block);
+                continue;
+            }
+        }
+
+        result.push(GetRange {
+            offset: block.offset,
+            len: block.len,
+            blocks: vec![*block],
+        });
+    }
+
+    result
+}
+
+pub struct WindowedReaderIter<R> {
+    // index_iter
+    blocks: Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>,
+    block_iter: Option<BlockIter<Vec<u8>>>,
+    first: bool,
+    valid: bool,
+    k: Vec<u8>,
+    it_type: ReaderIterType,
+    _r: PhantomData<R>,
+}
+
+pub type BlockStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, Error>> + Send>>;
+type BlockStreamItem = Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>;
+
+pub fn block_stream(
+    source: Arc<dyn AsyncReadBytes>, // need to live after block_stream
+    ranges: Vec<GetRange>,
+    k: usize,
+) -> BlockStreamItem {
+    stream::iter(ranges)
+        .map(move |range| {
+            let source = Arc::clone(&source);
+            async move {
+                let data = source.read_range(range.offset, range.len).await?;
+                Ok((range, data))
+            }
+        })
+        .buffered(k)
+        .flat_map(|fetched| -> BlockStreamItem {
+            match fetched {
+                Ok((range, data)) => {
+                    let base = range.offset;
+                    stream::iter(range.blocks)
+                        .map(move |block| {
+                            let start = (block.offset - base) as usize;
+                            Ok(data.slice(start..start + block.len))
+                        })
+                        .boxed() // <- type erasure
+                }
+                Err(e) => stream::iter(vec![Err(e)]).boxed(), // <- même type effacé
+            }
+        })
+        .boxed()
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -896,6 +1019,23 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_async_read_bytes() -> Result<(), Error> {
+        let s3_reader = S3Reader::new("test-data.mtbl".to_owned(), "mtbl-test".to_owned()).await?;
+
+        const OFFSET: u64 = 4096;
+        const LEN: usize = 100;
+
+        let old: Vec<u8> = s3_reader.read_at(OFFSET, LEN).await.unwrap();
+        let new: bytes::Bytes = s3_reader.read_range(OFFSET, LEN).await.unwrap();
+
+        assert_eq!(old.len(), LEN);
+        assert_eq!(new.len(), LEN);
+        assert_eq!(new.as_ref(), old.as_slice());
+
+        Ok(())
+    }
+
     async fn iter_s3(mpb: MultiProgress) -> Result<(), Error> {
         let s3_reader = S3Reader::new("test-data.mtbl".to_owned(), "mtbl-test".to_owned()).await?;
         let reader = AsyncReader::new(s3_reader).await?;
@@ -938,12 +1078,77 @@ mod tests {
         Ok(())
     }
 
+    // #[tokio::test]
+    // async fn test_coalesce() -> Result<(), Error> {
+    //     let blocks = vec![
+    //         BlockMeta { offset: 0, len: 10 },
+    //         BlockMeta { offset: 10, len: 5 },
+    //         BlockMeta {
+    //             offset: 20,
+    //             len: 10,
+    //         },
+    //         BlockMeta {
+    //             offset: 100,
+    //             len: 10,
+    //         },
+    //     ];
+
+    //     let merged = coalesce(&blocks, 32);
+
+    //     let result = vec![
+    //         BlockMeta { offset: 0, len: 15 },
+    //         BlockMeta {
+    //             offset: 20,
+    //             len: 10,
+    //         },
+    //         BlockMeta {
+    //             offset: 100,
+    //             len: 10,
+    //         },
+    //     ];
+
+    //     assert_eq!(merged, result);
+    //     Ok(())
+    // }
+
+    struct FakeSource {
+        data: Bytes,
+    }
+
+    #[async_trait]
+    impl AsyncReadBytes for FakeSource {
+        async fn read_range(&self, offset: u64, length: usize) -> Result<Bytes, Error> {
+            let s = offset as usize;
+            Ok(self.data.slice(s..s + length))
+        }
+    }
+
+    fn m(offset: u64, len: usize) -> BlockMeta {
+        BlockMeta { offset, len }
+    }
+
+    #[tokio::test]
+    async fn tes_block_stream_return_order() {
+        let data = Bytes::from((0u32..32).map(|i| i as u8).collect::<Vec<u8>>());
+        let metas = vec![m(0, 8), m(8, 8), m(16, 8), m(24, 8)];
+        let ranges = coalesce(&metas, 16); 
+
+        let source = Arc::new(FakeSource { data: data.clone() });
+        let stream = block_stream(source, ranges, 2);
+
+        let got: Vec<Bytes> = stream.map(|b| b.expect("")).collect().await;
+
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0], data.slice(0..8));
+        assert_eq!(got[1], data.slice(8..16));
+        assert_eq!(got[3], data.slice(24..32));
+    }
+
     #[tokio::test]
     async fn test_iter_both() -> Result<(), Error> {
         let path = "test-data.mtbl".to_owned();
         let mpb = MultiProgress::new();
 
-        // MultiProgress est cloneable (interne Arc) -> partageable entre tasks
         let mpb_local = mpb.clone();
 
         let s3_task = tokio::spawn(async move {
